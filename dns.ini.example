@@ -1,0 +1,43 @@
+[DEFAULT]
+# Override any of these defaults in the [main] section
+
+# This is the address for the server to bind to
+bind_addr = 127.0.0.1
+# This is the port the server will bind to
+bind_port = 5300
+# This is timeout (in seconds) for upstream connections
+upstream_timeout = 5
+# This is a space separated list of IPs to connect to as upstream DNS servers
+upstream_dns = 8.8.8.8
+# For all "dns:" overrides (see below), if "exact" is true, the domain name
+# being queried *must* match exactly. The default here is false, which
+# means that a lookup for a.b.c.com would match a "dns:" entry of c.com,
+# b.c.com or a.b.c.com
+exact = false
+# If this is true in a "dns:" section, when the specified upstream(s) for
+# the overriden domain is down, the proxy will fall back to using the default
+# upstreams.
+fallback = false
+# Fallback retry period, in seconds.  If the upstream(s) for a "dns:" section
+# are down, this is how frequently to retry the upstream(s)
+fallback_retry = 5
+# This is for internal tracking only, DO NOT USE
+fallen_back = false
+
+[main]
+# Override defaults here
+
+# You can specify as many sections here to override the default upstreams
+# for a given domain. These will be searched in most-specific order, which
+# means that an entry for a.b.com will be used before a separate entry for
+# b.com.
+#
+# The format here is simple, you just specify a section named "dns:<domain>"
+[dns:example.com]
+# Like the main upstreams, this is a space_separated list of upstream
+# DNS server IPs
+upstreams = 1.1.1.1 8.8.4.4
+# We only want to match example.com *only* for this override
+exact = true
+# If nothing custom responds here, fallback to the defaults
+fallback = true
