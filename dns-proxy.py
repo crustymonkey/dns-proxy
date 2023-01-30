@@ -13,7 +13,7 @@ from socketserver import ThreadingUDPServer, BaseRequestHandler
 from threading import Thread
 
 
-VERSION = '0.0.1'
+VERSION = '0.0.2'
 
 
 class DNSConfig(ConfigParser):
@@ -116,7 +116,13 @@ class RetryThread(Thread):
                 if (sect.startswith('dns:') and
                     self.conf.getboolean(sect, 'fallen_back')
                 ):
-                    self._check_upstreams(sect)
+                    try:
+                        self._check_upstreams(sect)
+                    except Exception as e:
+                        logging.warning(
+                            'An error occurred in the retry thread '
+                            'rechecking upstreams: {e}'
+                        )
 
             time.sleep(self._retry_int)
 
@@ -125,9 +131,10 @@ class RetryThread(Thread):
         We basically just re-use a method in the DNSProxyHandler here
         """
         timeout = self.conf.getint('main', 'upstream_timeout')
+        upstreams = self.conf[section]['upstreams'].strip().split()
         socks, ep = DNSProxyHandler.send_and_get_epoll(
             self._sample_query,
-            self.conf[section]['upstreams'].strip().split(),
+            upstreams,
             timeout,
         )
 
