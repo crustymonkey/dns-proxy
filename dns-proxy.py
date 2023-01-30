@@ -195,6 +195,8 @@ class DNSProxyHandler(BaseRequestHandler):
 
         for fd, _ in ready:
             resp = socks[fd].recv(65535)
+            remote = socks[fd].getpeername()
+            logging.debug(f'Received response for {qname} from {remote}')
 
             # As soon as we get a response from a server, just close
             # all the sockets and break out of the loop
