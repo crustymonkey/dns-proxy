@@ -17,23 +17,182 @@ from threading import Thread
 VERSION = '0.1.2'
 
 
-@dataclass
-class Question:
-    qname: bytes
-    qtype: int
-    qclass: int
+class DNSMessage:
+    def __init__(self, qbytes):
+        self.id = 0
+        self.qr = 0
+        self.opcode = 0
+        self.aa = 0
+        self.tc = 0
+        self.rd = 0
+        self.ra = 0
+        self.z = 0
+        self.rcode = 0
+        self.qdcount = 0
+        self.ancount = 0
+        self.nscount = 0
+        self.arcount = 0
+
+        self.parse_msg(qbytes)
+
+    def parse_msg(self, qbytes):
+        raise NotImplemented()
+
+    def parse_headers(self, msg: BytesIO):
+        self.id = self.to_int(msg.read(2))
+
+        flags = self.to_int(msg.read(2))
+        self._set_flags(flags)
+
+        self.qdcount = self.to_int(msg.read(2))
+        self.ancount = self.to_int(msg.read(2))
+        self.nscount = self.to_int(msg.read(2))
+        self.arcount = self.to_int(msg.read(2))
+
+        return msg
+
+    def parse_qname(self, data):
+        labels = self._parse_labels(data)
+        return b'.'.join(labels)
+
+    def parse_labels(self, data):
+        labels = []
+        llen = self.to_int(data.read(1))  # 1st label len
+        while llen > 0:
+            if llen < 64:
+                # Standard question
+                labels.append(data.read(llen))
+                llen = self.to_int(data.read(1))
+            else:
+                # domain name compression
+                llen = llen & 0x3f
+                offset = (llen << 8) + self.to_int(data.read(1))
+
+                # Create a copy of the entire message to recurse
+                msg_copy = BytesIO(data.get_value())
+                msg_copy.seek(offset)
+
+                labels.extend(self._parse_labels(msg_copy))
+                return labels
+
+        return labels
+
+    def to_int(self, bytes_):
+        return int.from_bytes(bytes_, 'big')
+
+    def _set_flags(self, flags):
+        self.qr = flags & 0x8000
+        self.opcode = flags & 0x7800
+        self.aa = flags & 0x0400
+        self.tc = flags & 0x0200
+        self.rd = flags & 0x0100
+        # Skip Z
+        self.rcode = flags & 0x000f
+
+
+class DNSQuestion(DNSMessage):
+    def __init__(self, qbytes):
+        self._qbytes = qbytes
+        self.qname = b''
+        self.qtype = 0
+        self.qclass = 0
+        super().__init__(qbytes)
+
+    def parse_msg(self, qbytes):
+        msg = BytesIO(qbytes)
+        msg = self.parse_headers(msg)
+
+        self.qname, self.qtype, self.qclass = self._get_question()
+
+    def _get_question(self, data):
+        labels = []
+
+        qname = self.parse_qname(data)
+        qtype = self.to_int(data.read(2))
+        qclass = self.to_int(data.read(2))
+
+        return (qname, qtype, qclass)
 
     def to_tup(self):
         return (self.qname, self.qtype, self.qclass)
 
 
 @dataclass
-class CacheEntry:
-    resp: bytes
-    added: int  # timestamp
+class Answer:
+    name: bytes
+    atype: int
+    aclass: int
+    ttl_offset: int
+    ttl: int
+    rdlen: int
+    rdata: bytes
 
-    def get_resp_questions(self):
-        pass
+
+class DNSResponse(DNSMessage):
+    def __init__(self, rbytes):
+        self._rbytes = rbytes
+        self.create_time = int(time.time())
+        self.answers = []
+
+    def parse_msg(self, rbytes):
+        msg = BytesIO(rbytes)
+        msg = self.parse_headers(msg)
+
+        self.answers = self.parse_answers(msg)
+
+    def parse_answers(self, msg):
+        answers = []
+
+        for _ in range(self.ancount + self.nscount + self.arcount):
+            name = self.parse_qname(msg),
+            atype = self.to_int(msg.read(2)),
+            aclass = self.to_int(msg.read(2)),
+            ttl_offset = msg.tell()
+            ttl = self.to_int(msg.read(4)),
+            rdlen = self.to_int(msg.read(2)),
+            rdata = msg.read(rdlen)
+
+            answers.append(Answer(
+                name=name,
+                atype=atype,
+                aclass=aclass,
+                ttl_offset=ttl_offset,
+                ttl=ttl,
+                rdlen=rdlen,
+                rdata=rdata,
+            ))
+
+        return answers
+
+    def is_valid(self):
+        """
+        Checks to see if any of the TTLs have expired in this response.
+        If any have expired, False is returned.
+        """
+        cur_time = int(time.time())
+        for ans in self.answers:
+            if self.create_time + ans.ttl < cur_time:
+                # This has expired
+                return False
+
+        return True
+
+    def update_ttls(self):
+        """
+        Updates the TTLs in the orignal response bytes and returns the
+        updated response bytes
+        """
+        rbytes = self._rbytes  # make a copy
+
+        cur_time = int(time.time())
+        for ans in self.answers:
+            new_ttl = cur_time - (self.create_time + ans.ttl)
+            ans.ttl = new_ttl
+            off = ans.ttl_offset
+            rbytes[off:off+4] = new_ttl.to_bytes(4, 'big')
+
+        return rbytes
+
 
 class Cache:
     def __init__(self):
@@ -44,33 +203,27 @@ class Cache:
         This will check to see if there's a cached answer to be returned, or
         None.
         """
-        question = self._parse_req(request)
+        if not isinstance(request, DNSQuestion):
+            question = DNSQuestion(request)
+        else:
+            question = request
 
-        if question.to_tup() not in self.cache:
+        qtup = question.to_tup()
+
+        if qtup not in self.cache:
             # Return quickly if it's not in the cache
             return None
 
-        entry = self.cache[question.to_tup()]
-        upd_resp = self._update_response(entry)
+        dns_resp = self.cache[qtup]
+        if not dns_resp.is_valid():
+            # Expired TTLs
+            return None
 
+        # Return the updated response bytes
+        return dns_resp.update_ttls()
 
-    def _parse_req(self, request):
-        """
-        Parse out the qname, the qtype, and class from the question
-        """
-        req = BytesIO(request)
-        # Skip to the question section
-        req.seek(12)
-
-        question = DNSProxyHandler.get_question(req)
-
-        return question
-
-    def _update_response(self, ce: CacheEntry):
-        ttl = self._get_ttl(ce.resp)
-
-    def _to_int(self, bytes_):
-        return int.from_bytes(bytes_, 'big')
+    def set(self, key, val):
+        self._cache[key] = val
 
 
 class DNSConfig(ConfigParser):
@@ -217,10 +370,14 @@ class DNSProxyHandler(BaseRequestHandler):
         data, sock = self.request
         logging.debug(f'got data: {data}')
 
-        qname = self._get_qname(data)
-        upstreams = self.server.conf.get_upstreams(qname)
-
-        resp = self._proxy_to_upstreams(data, upstreams, qname)
+        question = DNSQuestion(data)
+        # Check the cache first
+        resp = self.server.cache.get(question)
+        if not resp:
+            # We don't have a valid cached entry, do the things
+            upstreams = self.server.conf.get_upstreams(question.qname)
+            resp = self._proxy_to_upstreams(data, upstreams, question.qname)
+            self.server.cache.set(question.to_tup(), DNSResponse(resp))
 
         sock.sendto(resp, self.client_address)
 
@@ -310,61 +467,13 @@ class DNSProxyHandler(BaseRequestHandler):
                 logging.warning(f'Error closing socket: {e}')
 
 
-    def _get_qname(self, req_data):
-        """
-        Take the incoming request data and pase the qname from it to
-        determine if we forward to a different upstream instead of
-        the defaults
-        """
-        # The BytesIO just makes moving the pointer much easier
-        data = BytesIO(req_data)
-        # Skip to the question
-        data.seek(12)
-
-        q = self.get_question(data)
-
-        return q.qname
-
-    @classmethod
-    def get_question(cls, data):
-        labels = []
-
-        llen = self._to_int(data.read(1))  # 1st label len
-        while llen > 0:
-            if llen < 64:
-                # Standard question
-                cur_qname += b'.' + data.read(llen)
-                llen = self._to_int(data.read(1))
-            else:
-                # domain name compression
-                llen = llen & 0x3f
-                offset = (llen << 8) + self._to_int(data.read(1))
-
-                # Create a copy of the entire message to recurse
-                msg_copy = BytesIO(data.get_value())
-                msg_copy.seek(offset)
-
-                labels.extend(self._parse_labels(msg_copy))
-                return labels
-
-        ret = Question(
-            qname=b'.'.join(labels),
-            qtype=self.to_int(data.read(2)),
-            qclass=self.to_int(data.read(2)),
-        )
-
-        return ret
-
-    @staticmethod
-    def to_int(bytes_):
-        return int.from_bytes(bytes_, 'big')
-
-
 class DNSProxyServer(ThreadingUDPServer):
     def __init__(self, *args, **kwargs):
+        self.cache = Cache()
         # Grab and store the configuration arg
         self.conf = kwargs['conf']
         del kwargs['conf']
+
         # And finally, call the upstream method
         super().__init__(*args, **kwargs)
 
