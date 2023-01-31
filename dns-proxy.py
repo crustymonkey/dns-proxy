@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import logging
+import os
 import select
 import socket
 import struct
@@ -10,6 +11,7 @@ from argparse import ArgumentParser
 from configparser import ConfigParser
 from dataclasses import dataclass
 from io import BytesIO
+from random import randint
 from socketserver import ThreadingUDPServer, BaseRequestHandler
 from threading import Thread
 
@@ -52,7 +54,7 @@ class DNSMessage:
         return msg
 
     def parse_qname(self, data):
-        labels = self._parse_labels(data)
+        labels = self.parse_labels(data)
         return b'.'.join(labels)
 
     def parse_labels(self, data):
@@ -69,13 +71,22 @@ class DNSMessage:
                 offset = (llen << 8) + self.to_int(data.read(1))
 
                 # Create a copy of the entire message to recurse
-                msg_copy = BytesIO(data.get_value())
+                msg_copy = BytesIO(data.getvalue())
                 msg_copy.seek(offset)
 
-                labels.extend(self._parse_labels(msg_copy))
+                labels.extend(self.parse_labels(msg_copy))
                 return labels
 
         return labels
+
+    def get_question(self, data):
+        labels = []
+
+        qname = self.parse_qname(data)
+        qtype = self.to_int(data.read(2))
+        qclass = self.to_int(data.read(2))
+
+        return (qname, qtype, qclass)
 
     def to_int(self, bytes_):
         return int.from_bytes(bytes_, 'big')
@@ -102,16 +113,7 @@ class DNSQuestion(DNSMessage):
         msg = BytesIO(qbytes)
         msg = self.parse_headers(msg)
 
-        self.qname, self.qtype, self.qclass = self._get_question()
-
-    def _get_question(self, data):
-        labels = []
-
-        qname = self.parse_qname(data)
-        qtype = self.to_int(data.read(2))
-        qclass = self.to_int(data.read(2))
-
-        return (qname, qtype, qclass)
+        self.qname, self.qtype, self.qclass = self.get_question(msg)
 
     def to_tup(self):
         return (self.qname, self.qtype, self.qclass)
@@ -130,14 +132,17 @@ class Answer:
 
 class DNSResponse(DNSMessage):
     def __init__(self, rbytes):
+        logging.debug(f'Resp bytes: {rbytes}')
         self._rbytes = rbytes
         self.create_time = int(time.time())
         self.answers = []
+        super().__init__(rbytes)
 
     def parse_msg(self, rbytes):
         msg = BytesIO(rbytes)
         msg = self.parse_headers(msg)
 
+        self.get_question(msg)
         self.answers = self.parse_answers(msg)
 
     def parse_answers(self, msg):
@@ -145,11 +150,11 @@ class DNSResponse(DNSMessage):
 
         for _ in range(self.ancount + self.nscount + self.arcount):
             name = self.parse_qname(msg),
-            atype = self.to_int(msg.read(2)),
-            aclass = self.to_int(msg.read(2)),
+            atype = self.to_int(msg.read(2))
+            aclass = self.to_int(msg.read(2))
             ttl_offset = msg.tell()
-            ttl = self.to_int(msg.read(4)),
-            rdlen = self.to_int(msg.read(2)),
+            ttl = self.to_int(msg.read(4))
+            rdlen = self.to_int(msg.read(2))
             rdata = msg.read(rdlen)
 
             answers.append(Answer(
@@ -177,21 +182,28 @@ class DNSResponse(DNSMessage):
 
         return True
 
-    def update_ttls(self):
+    def update_ttls(self, qid):
         """
         Updates the TTLs in the orignal response bytes and returns the
         updated response bytes
         """
-        rbytes = self._rbytes  # make a copy
+        rbytes = bytearray(self._rbytes)  # create an array for modification
 
+        # First, update the id
+        rbytes[:2] = qid.to_bytes(2, 'big')
+
+        new_ans = []
         cur_time = int(time.time())
         for ans in self.answers:
             new_ttl = cur_time - (self.create_time + ans.ttl)
             ans.ttl = new_ttl
             off = ans.ttl_offset
             rbytes[off:off+4] = new_ttl.to_bytes(4, 'big')
+            new_ans.append(ans)
 
-        return rbytes
+        self.answers = new_ans
+
+        return bytes(rbytes)
 
 
 class Cache:
@@ -210,17 +222,20 @@ class Cache:
 
         qtup = question.to_tup()
 
-        if qtup not in self.cache:
+        if qtup not in self._cache:
             # Return quickly if it's not in the cache
             return None
 
-        dns_resp = self.cache[qtup]
+        dns_resp = self._cache[qtup]
         if not dns_resp.is_valid():
             # Expired TTLs
             return None
 
         # Return the updated response bytes
-        return dns_resp.update_ttls()
+        resp = dns_resp.update_ttls(question.id)
+        self._cache[qtup] = dns_resp
+
+        return resp
 
     def set(self, key, val):
         self._cache[key] = val
@@ -306,7 +321,7 @@ class DNSConfig(ConfigParser):
 
 class RetryThread(Thread):
     # This is the base of a check for response
-    _sample_query = (
+    _sample_query = bytearray(
         b'>\x0b\x01 \x00\x01\x00\x00\x00\x00\x00\x01\x06google\x03com\x00'
         b'\x00\x01\x00\x01\x00\x00)\x04\xd0\x00\x00\x00\x00\x00\x0c\x00\n'
         b'\x00\x08r\x88\x96\x84\xea\xb8\x0f5'
@@ -342,9 +357,10 @@ class RetryThread(Thread):
         """
         timeout = self.conf.getint('main', 'upstream_timeout')
         upstreams = self.conf[section]['upstreams'].strip().split()
-        # TODO: randomize the id in the sample query
+        self._sample_query[:2] = os.urandom(2)
+
         socks, ep = DNSProxyHandler.send_and_get_epoll(
-            self._sample_query,
+            bytes(self._sample_query),
             upstreams,
             timeout,
         )
@@ -371,13 +387,19 @@ class DNSProxyHandler(BaseRequestHandler):
         logging.debug(f'got data: {data}')
 
         question = DNSQuestion(data)
+
         # Check the cache first
         resp = self.server.cache.get(question)
-        if not resp:
+
+        if resp:
+            logging.debug(f'Serving response from cache for {question.qname}')
+        else:
+            logging.debug(f'Cache miss for {question.qname}')
             # We don't have a valid cached entry, do the things
             upstreams = self.server.conf.get_upstreams(question.qname)
             resp = self._proxy_to_upstreams(data, upstreams, question.qname)
             self.server.cache.set(question.to_tup(), DNSResponse(resp))
+
 
         sock.sendto(resp, self.client_address)
 
