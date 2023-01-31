@@ -8,12 +8,69 @@ import sys
 import time
 from argparse import ArgumentParser
 from configparser import ConfigParser
+from dataclasses import dataclass
 from io import BytesIO
 from socketserver import ThreadingUDPServer, BaseRequestHandler
 from threading import Thread
 
 
-VERSION = '0.0.2'
+VERSION = '0.1.2'
+
+
+@dataclass
+class Question:
+    qname: bytes
+    qtype: int
+    qclass: int
+
+    def to_tup(self):
+        return (self.qname, self.qtype, self.qclass)
+
+
+@dataclass
+class CacheEntry:
+    resp: bytes
+    added: int  # timestamp
+
+    def get_resp_questions(self):
+        pass
+
+class Cache:
+    def __init__(self):
+        self._cache = {}
+
+    def get(self, request):
+        """
+        This will check to see if there's a cached answer to be returned, or
+        None.
+        """
+        question = self._parse_req(request)
+
+        if question.to_tup() not in self.cache:
+            # Return quickly if it's not in the cache
+            return None
+
+        entry = self.cache[question.to_tup()]
+        upd_resp = self._update_response(entry)
+
+
+    def _parse_req(self, request):
+        """
+        Parse out the qname, the qtype, and class from the question
+        """
+        req = BytesIO(request)
+        # Skip to the question section
+        req.seek(12)
+
+        question = DNSProxyHandler.get_question(req)
+
+        return question
+
+    def _update_response(self, ce: CacheEntry):
+        ttl = self._get_ttl(ce.resp)
+
+    def _to_int(self, bytes_):
+        return int.from_bytes(bytes_, 'big')
 
 
 class DNSConfig(ConfigParser):
@@ -132,6 +189,7 @@ class RetryThread(Thread):
         """
         timeout = self.conf.getint('main', 'upstream_timeout')
         upstreams = self.conf[section]['upstreams'].strip().split()
+        # TODO: randomize the id in the sample query
         socks, ep = DNSProxyHandler.send_and_get_epoll(
             self._sample_query,
             upstreams,
@@ -263,18 +321,19 @@ class DNSProxyHandler(BaseRequestHandler):
         # Skip to the question
         data.seek(12)
 
-        labels = self._parse_labels(data)
+        q = self.get_question(data)
 
-        return b'.'.join(labels)
+        return q.qname
 
-    def _parse_labels(self, data):
+    @classmethod
+    def get_question(cls, data):
         labels = []
 
         llen = self._to_int(data.read(1))  # 1st label len
         while llen > 0:
             if llen < 64:
                 # Standard question
-                labels.append(data.read(llen))
+                cur_qname += b'.' + data.read(llen)
                 llen = self._to_int(data.read(1))
             else:
                 # domain name compression
@@ -288,9 +347,16 @@ class DNSProxyHandler(BaseRequestHandler):
                 labels.extend(self._parse_labels(msg_copy))
                 return labels
 
-        return labels
+        ret = Question(
+            qname=b'.'.join(labels),
+            qtype=self.to_int(data.read(2)),
+            qclass=self.to_int(data.read(2)),
+        )
 
-    def _to_int(self, bytes_):
+        return ret
+
+    @staticmethod
+    def to_int(bytes_):
         return int.from_bytes(bytes_, 'big')
 
 
