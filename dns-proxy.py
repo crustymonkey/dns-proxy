@@ -16,7 +16,7 @@ from socketserver import ThreadingUDPServer, BaseRequestHandler
 from threading import Thread
 
 
-VERSION = '0.1.2'
+VERSION = '0.2.0'
 
 
 class DNSMessage:
@@ -149,13 +149,16 @@ class DNSResponse(DNSMessage):
         answers = []
 
         for _ in range(self.ancount + self.nscount + self.arcount):
-            name = self.parse_qname(msg),
+            name = self.parse_qname(msg)
             atype = self.to_int(msg.read(2))
             aclass = self.to_int(msg.read(2))
             ttl_offset = msg.tell()
             ttl = self.to_int(msg.read(4))
             rdlen = self.to_int(msg.read(2))
             rdata = msg.read(rdlen)
+
+            if not name:
+                continue
 
             answers.append(Answer(
                 name=name,
@@ -192,16 +195,12 @@ class DNSResponse(DNSMessage):
         # First, update the id
         rbytes[:2] = qid.to_bytes(2, 'big')
 
-        new_ans = []
         cur_time = int(time.time())
         for ans in self.answers:
-            new_ttl = cur_time - (self.create_time + ans.ttl)
-            ans.ttl = new_ttl
+            new_ttl = ans.ttl - (cur_time - self.create_time)
             off = ans.ttl_offset
             rbytes[off:off+4] = new_ttl.to_bytes(4, 'big')
-            new_ans.append(ans)
 
-        self.answers = new_ans
 
         return bytes(rbytes)
 
